@@ -3,6 +3,13 @@
 A page-fault based watchpoint engine for Linux/WSL **x86_64**: an unlimited
 number of watched ranges, no hardware debug registers involved.
 
+**Longer documentation lives in [`docs/`](docs/):**
+[`architecture.md`](docs/architecture.md) (mechanism, state machine, remote-call
+protocol) · [`invariants.md`](docs/invariants.md) (the audit behind every
+guarantee) · [`testing.md`](docs/testing.md) (how to run and extend the suite) ·
+[`design-notes.md`](docs/design-notes.md) (kernel findings, decisions,
+limitations). [`AGENTS.md`](AGENTS.md) is the working agreement for this repo.
+
 * Mechanism: `ptrace` + `PROT_NONE` + `SIGSEGV`.
 * Watched pages are kept `PROT_NONE`; every access traps, the tracer stops the
   whole target, runs the user callback, replays the faulting instruction and
@@ -31,8 +38,9 @@ attach -> arm(PROT_NONE) -> SIGSEGV -> idle/entering -> global stop -> critical
 | `src/watch.cpp` | range validation, protection capture, arm/disarm ordering |
 | `src/event.cpp` | event loop, fault sequence, clone/exit/signal handling |
 | `src/ctx.cpp` | context lifecycle, attach/detach |
-| `tests/` | test harness and 15 cases (A-M + stress) |
-| `examples/` | manual two-terminal demo |
+| `tests/` | test harness and 14 cases (A-M) plus stress rounds |
+| `examples/` | manual two-terminal demo, or self-contained |
+| `docs/` | architecture, invariants, testing, design notes |
 
 ## Build and test (WSL)
 

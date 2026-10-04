@@ -243,7 +243,7 @@ rc_t mw_inv_check(mw_ctx_t *ctx, const char *where) {
     why = "in_rcall outside rcall state";
   }
 
-  /* I4/I5: a pending fault exists exactly while a fault is being handled, and
+  /* I4: a pending fault exists exactly while a fault is being handled, and
    * that spans the whole sequence: critical (callback), rcall (the remote
    * mprotect that releases ownership), sstep (the single step) and rearming.
    * It must never survive into idle, entering or detaching. */
@@ -265,7 +265,7 @@ rc_t mw_inv_check(mw_ctx_t *ctx, const char *where) {
     case mw_state_t::entering:
     case mw_state_t::critical:
     case mw_state_t::rearming:
-      /* I4: zero target user threads execute. */
+      /* I3: zero target user threads execute. */
       if (running != 0) {
         bad = true;
         why = "target thread running inside a zero-run state";
@@ -273,7 +273,7 @@ rc_t mw_inv_check(mw_ctx_t *ctx, const char *where) {
       break;
     case mw_state_t::rcall:
     case mw_state_t::sstep:
-      /* I2/I3: at most one target thread executes, and it is the right one. */
+      /* I2: at most one target thread executes, and it is the right one. */
       if (running > 1) {
         bad = true;
         why = "more than one thread running in rcall/sstep";
