@@ -541,3 +541,177 @@ rc_t mw_remote_mprotect(mw_ctx_t *ctx, uintptr_t addr, size_t len, int prot) {
   }
   return rc_t::ok;
 }
+
+rc_t mw_remote_call(mw_ctx_t *ctx, pid_t tid, uintptr_t func_addr,
+                    const unsigned long *args, size_t nargs,
+                    unsigned long *out_ret) {
+  unsigned char stub[17];
+  unsigned char pristine[17];
+  user_regs_struct snap;
+  user_regs_struct run;
+  pid_t borrow_tid = tid;
+  int status = 0;
+  rc_t r;
+  mw_state_t prev;
+
+  if (ctx == nullptr || func_addr == 0 || nargs > 6) {
+    return rc_t::err_invalid;
+  }
+  if (!state_allows_remote(ctx->st)) {
+    mw_log("remote call refused in state (borrow active or idle)");
+    return rc_t::err_state;
+  }
+  if (ctx->in_rcall || ctx->borrow_tid != 0) {
+    return rc_t::err_state;
+  }
+  if (ctx->poisoned) {
+    return rc_t::err_poisoned;
+  }
+  if (!ctx->stub_ready) {
+    mw_log("remote call refused: code cave not initialized");
+    return rc_t::err_stub_write;
+  }
+
+  r = mw_thr_ensure_all_stopped(ctx);
+  if (r != rc_t::ok) {
+    return r;
+  }
+
+  if (borrow_tid <= 0) {
+    r = pick_borrow(ctx, &borrow_tid);
+    if (r != rc_t::ok) {
+      return r;
+    }
+  } else {
+    thr_t *t = mw_thr_find_alive(ctx, borrow_tid);
+    if (t == nullptr || t->running) {
+      return rc_t::err_nothread;
+    }
+  }
+
+  /* 49 BB <8 bytes func_addr>  : movabs r11, func_addr
+   * 48 31 C0                   : xor rax, rax (variadic ABI: 0 vector regs)
+   * 41 FF D3                   : call r11
+   * CC                         : int3 */
+  stub[0] = 0x49;
+  stub[1] = 0xBB;
+  (void)memcpy(&stub[2], &func_addr, sizeof func_addr);
+  stub[10] = 0x48;
+  stub[11] = 0x31;
+  stub[12] = 0xC0;
+  stub[13] = 0x41;
+  stub[14] = 0xFF;
+  stub[15] = 0xD3;
+  stub[16] = 0xCC;
+
+  if (mw_vm_read(ctx->pid, ctx->stub_page, pristine, sizeof pristine) !=
+      static_cast<ssize_t>(sizeof pristine)) {
+    mw_log("remote call: cannot read code cave at 0x%lx", ctx->stub_page);
+    return rc_t::err_stub_write;
+  }
+
+  if (ptrace(PTRACE_GETREGS, borrow_tid, nullptr, &snap) == -1) {
+    mw_log_errno("remote call: PTRACE_GETREGS(%d)", borrow_tid);
+    return rc_t::err_ptrace;
+  }
+
+  run = snap;
+  run.rip = ctx->stub_page;
+  /* Align stack to 16 bytes while honoring the 128-byte x86-64 red zone */
+  run.rsp = (snap.rsp - 128U) & ~0x0fULL;
+  if (nargs > 0 && args != nullptr) run.rdi = args[0];
+  if (nargs > 1 && args != nullptr) run.rsi = args[1];
+  if (nargs > 2 && args != nullptr) run.rdx = args[2];
+  if (nargs > 3 && args != nullptr) run.rcx = args[3];
+  if (nargs > 4 && args != nullptr) run.r8  = args[4];
+  if (nargs > 5 && args != nullptr) run.r9  = args[5];
+  run.orig_rax = static_cast<unsigned long long>(-1);
+
+  if (mw_vm_write(ctx->pid, ctx->stub_page, stub, sizeof stub) !=
+      static_cast<ssize_t>(sizeof stub)) {
+    mw_log_errno("remote call: writing stub at 0x%lx", ctx->stub_page);
+    return rc_t::err_stub_write;
+  }
+
+  if (ptrace(PTRACE_SETREGS, borrow_tid, nullptr, &run) == -1) {
+    mw_log_errno("remote call: PTRACE_SETREGS(%d)", borrow_tid);
+    (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+    return rc_t::err_ptrace;
+  }
+
+  prev = ctx->st;
+  ctx->borrow_regs_snap = snap;
+  ctx->in_rcall = true;
+  ctx->borrow_tid = borrow_tid;
+  ctx->st = mw_state_t::rcall;
+  ++ctx->stats.remote_calls;
+
+  if (ptrace(PTRACE_CONT, borrow_tid, nullptr, nullptr) == -1) {
+    mw_log_errno("remote call: PTRACE_CONT(%d)", borrow_tid);
+    (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+    unwind(ctx, borrow_tid, &snap, prev);
+    return rc_t::err_ptrace;
+  }
+  mw_thr_note_running(ctx, borrow_tid);
+
+  for (unsigned attempt = 0;; ++attempt) {
+    r = mw_thr_wait(ctx, borrow_tid, &status);
+    if (r != rc_t::ok) {
+      (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+      mw_thr_mark_dead(ctx, borrow_tid);
+      ctx->in_rcall = false;
+      ctx->borrow_tid = 0;
+      ctx->st = prev;
+      return r;
+    }
+    mw_thr_note_stopped(ctx, borrow_tid);
+
+    if (is_controlled_trap(status)) {
+      break;
+    }
+    if (attempt < MW_BORROW_MAX_SPURIOUS_STOPS && is_group_stop(status)) {
+      mw_log("remote call: in-flight group stop status=0x%x, continuing", status);
+      if (ptrace(PTRACE_CONT, borrow_tid, nullptr, nullptr) == -1) {
+        mw_log_errno("remote call: PTRACE_CONT after group stop(%d)", borrow_tid);
+        (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+        unwind(ctx, borrow_tid, &snap, prev);
+        return rc_t::err_ptrace;
+      }
+      mw_thr_note_running(ctx, borrow_tid);
+      continue;
+    }
+
+    mw_log("remote call: unexpected stop status=0x%x (expected SIGTRAP)", status);
+    (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+    unwind(ctx, borrow_tid, &snap, prev);
+    return rc_t::err_unexpected;
+  }
+
+  if (ptrace(PTRACE_GETREGS, borrow_tid, nullptr, &run) == -1) {
+    mw_log_errno("remote call: PTRACE_GETREGS after trap");
+    (void)mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine);
+    unwind(ctx, borrow_tid, &snap, prev);
+    return rc_t::err_ptrace;
+  }
+
+  if (out_ret != nullptr) {
+    *out_ret = static_cast<unsigned long>(run.rax);
+  }
+
+  if (ptrace(PTRACE_SETREGS, borrow_tid, nullptr, &snap) == -1) {
+    mw_log_errno("remote call: PTRACE_SETREGS restore(%d)", borrow_tid);
+    mw_poison(ctx, rc_t::err_ptrace, "remote-call-restore");
+  }
+  if (mw_vm_write(ctx->pid, ctx->stub_page, pristine, sizeof pristine) !=
+      static_cast<ssize_t>(sizeof pristine)) {
+    mw_log("remote call: could not restore code cave bytes");
+    mw_poison(ctx, rc_t::err_stub_write, "remote-call-stub-restore");
+  }
+
+  ctx->in_rcall = false;
+  ctx->borrow_tid = 0;
+  ctx->st = prev;
+  (void)mw_inv_check(ctx, "mw_remote_call");
+  return rc_t::ok;
+}
+

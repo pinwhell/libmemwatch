@@ -1,131 +1,103 @@
-# AGENTS.md — working in this repository
+# AGENTS.md — Developer & AI Agent Directive for `libmemwatch`
 
-`libmemwatch` is a page-fault based watchpoint engine for Linux **x86_64**
-(`ptrace` + `PROT_NONE` + `SIGSEGV`). It is a tracer library: the process that
-links it becomes the parent-tracer of the target it watches. There is no
-hardware-debug-register path and no design freedom in the fault sequence — the
-correctness argument rests on a strict state machine, so read
-`docs/architecture.md` before changing anything in `src/`.
+`libmemwatch` is a high-performance, page-fault-driven **Execution Interceptor & Memory Watchpoint Engine** for Linux **x86_64** (`ptrace` + `PROT_NONE` + `SIGSEGV`). It turns the process that links it into an out-of-process parent-tracer capable of monitoring and controlling arbitrary memory regions in a tracee without hardware debug registers (`DR0`–`DR7`) and without target cooperation.
 
-- `docs/architecture.md` — mechanism, state machine, remote-call protocol.
-- `docs/invariants.md` — the hard invariants, where each is checked, how each is tested.
-- `docs/testing.md` — how to build, run, filter and extend the suite.
-- `docs/design-notes.md` — the non-obvious kernel/library facts, decisions, limitations.
+---
 
-## Layout
+## 1. Core Philosophy: Low-Level Freedom & Zero Bloat
 
-| path | contents |
-| --- | --- |
-| `include/memwatch/types.hpp` | `rc_t`, `mw_state_t`, `rng_t`, `pg_t`, `thr_t`, `mw_watch_t`, `mw_fault_t`, `mw_stats_t`, `mw_ctx_t` |
-| `include/memwatch/api.hpp` | the only public header (`extern "C"`) |
-| `include/memwatch/{thr,remote,watch,event}.hpp` | internal interfaces |
-| `include/memwatch/internal.hpp` | shared internals: wait flags, ptrace options, procfs, logging, invariants |
-| `src/thr.cpp` | thread table, global stop/resume, waits, seized baseline |
-| `src/remote.cpp` | gadget discovery, code cave, borrow/register restore |
-| `src/watch.cpp` | range validation, protection capture, arm/disarm ordering |
-| `src/event.cpp` | event classification, the fault sequence, clone/exit/signal handling |
-| `src/util.cpp` | procfs, `process_vm_readv/writev`, logging, poison, `mw_inv_check` |
-| `src/ctx.cpp` | context lifecycle, attach, detach |
-| `tests/` | harness + suite (cases A-M, stress rounds) |
-| `examples/` | `test_target` + `test_memwatch` demo |
+1. **The Frozen Sandbox**:
+   When a watchpoint triggers, the entire target process is frozen in a verified ptrace group stop (`mw_thr_count_running() == 0`). The user callback receives full low-level machine freedom:
+   * Inspect/modify general-purpose registers (`user_regs_struct`).
+   * Zero-copy virtual memory read/write via `process_vm_readv/writev`.
+   * Translate raw addresses to human-readable `module+0xoffset` (e.g. `libxyz.so+0x1120`) using `/proc/<pid>/maps` with **zero external dependencies**.
+   * Execute target functions or syscalls synchronously inside the target context.
+2. **Actionable Continuations**:
+   The callback chooses the execution policy via `mw_action_t`:
+   * `MW_ACTION_REPLAY`: Standard replay (temporarily restore permissions, single-step faulting thread, re-arm `PROT_NONE`, resume all).
+   * `MW_ACTION_SKIP`: User emulated the access or advanced `rip`. **The page never drops `PROT_NONE`**—eliminating the window of vulnerability against concurrent threads.
+   * `MW_ACTION_DISARM`: Permanently drop the watchpoint.
+3. **Lean Core vs Companion Libraries**:
+   * **Core Engine**: Pure C/C++ relying solely on Linux kernel primitives (`ptrace`, `/proc`, `process_vm_readv`). No bloat.
+   * **Companion Leverage**: Capstone (`libcapstone`) for decoding instruction sizes and assembly at `rip`. Linenoise for embedding an interactive debugger shell inside watch callbacks.
 
-## Build and verify
+---
 
-Run everything through WSL; the project root is the repo root.
+## 2. Layout
+
+| Path | Purpose |
+| :--- | :--- |
+| `include/memwatch/types.hpp` | Core types (`rc_t`, `mw_state_t`, `rng_t`, `pg_t`, `thr_t`, `mw_watch_t`, `mw_fault_t`, `mw_ctx_t`) |
+| `include/memwatch/api.hpp` | Public C interface (`extern "C"`) |
+| `include/memwatch/{thr,remote,watch,event}.hpp` | Subsystem internal headers |
+| `include/memwatch/internal.hpp` | Wait flags, ptrace options, logging, procfs, invariants |
+| `src/thr.cpp` | Thread inventory, global stop/resume convergence, waits |
+| `src/remote.cpp` | Bootstrap gadget scan, code cave lifecycle, register snapshot/unwind |
+| `src/watch.cpp` | Range validation, heterogeneous protection capture, arm/disarm ordering |
+| `src/event.cpp` | Event loop, fault sequence, clone/exit/signal transparency |
+| `src/util.cpp` | Procfs maps parsing, `process_vm_readv/writev`, poisoning, invariant checker |
+| `src/ctx.cpp` | Context lifecycle (`mw_ctx_init`, `mw_attach`, `mw_detach`) |
+| `tests/` | Test harness (`harness.cpp`) and verification suite (`t_main.cpp`, cases A-M + stress) |
+| `examples/` | Standalone and two-terminal demo drivers |
+| `docs/` | `architecture.md`, `design-notes.md`, `invariants.md`, `testing.md` |
+
+---
+
+## 3. Strict Non-Negotiable Rules
+
+1. **Never resume threads inside a critical section**:
+   `resume_now` must remain `false` for every event drained inside `entering`, `critical`, `rcall`, `sstep`, and `rearming`. Faulting instructions re-fault naturally after release; never "help" them forward.
+2. **`armed` is an ownership contract, not a status cache**:
+   * Disarming: Set `armed = false` **before** the remote `mprotect` that restores original protections.
+   * Arming: Set `armed = true` **only after** `PROT_NONE` has successfully been installed by the kernel.
+   * Reversing this order creates critical race windows and violates Invariant $I_5$.
+3. **Exclusive Thread Borrowing ($I_7$)**:
+   Exactly one alive, stopped thread is borrowed via `pick_borrow()`. Its full `user_regs_struct` is restored on unwind. Never issue `PTRACE_CONT` to any other thread during `rcall`.
+4. **Controlled Stops Only ($I_7, I_8$)**:
+   The only stop accepted during code cave execution is the `SIGTRAP` from its trailing `int3` (with tolerance for in-flight `PTRACE_EVENT_STOP` group stops). Any other signal aborts and poisons the context.
+5. **Signal Transparency ($I_{10}$)**:
+   Signals not owned by an armed watch must be forwarded untouched with their original `siginfo_t` using `PTRACE_SETSIGINFO` and `PTRACE_CONT(tid, sig)`. The target process must never perceive the tracer's existence on unmonitored signals.
+6. **Fail-Safe Poisoning ($I_{11}$)**:
+   If an invariant is breached or a register/protection restore fails, poison the context (`mw_poison()`). Watched pages stay `PROT_NONE` to prevent unwatched memory execution. Only `mw_detach()` and `mw_ctx_free()` remain legal.
+7. **Zero Suppressed Warnings**:
+   The build must compile warning-free with `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`. No warnings may be suppressed.
+
+---
+
+## 4. Build, Verification & Definition of Done
+
+All builds and tests run through WSL from the repository root:
 
 ```sh
-make                 # strict optimised build: lib, tests, examples
-make test            # whole suite (14 cases + 1 stress round), ~13 s
-make stress          # 40 multithreaded stress rounds
-make debug           # -O0 -g3 into build-debug/
-make examples        # demo binaries only
-make clean
-```
+# Clean build and run complete test suite (14 cases + stress)
+make clean && make
+make test
 
-Case selection while iterating:
-
-```sh
-./build/memwatch_tests -v --only 3            # one case, verbose
+# Run stress rounds (concurrency race verification)
 ./build/memwatch_tests --only-stress --stress 20
+
+# Debug build (-O0 -g3)
+make debug && ./build-debug/memwatch_tests --stress 2
+
+# Targeted iteration on specific test case
+./build/memwatch_tests -v --only 3   # 0=A, 1=B, 2=C, 3=D, ..., 13=M
 ```
 
-`--only <n>` indexes `g_cases[]` in `tests/t_main.cpp`:
-`0 A`, `1 B`, `2 C`, `3 D`, `4 E`, `5 F`, `6 G`, `7 H`, `8 I`, `9 J`, `10 K`,
-`11 L hole`, `12 L mprotect failure`, `13 M`.
+### Definition of Done
+Do not declare a change functional until:
+1. `make clean && make` succeeds with 0 warnings.
+2. `make test` passes all 15/15 cases.
+3. Stress testing passes: `./build/memwatch_tests --only-stress --stress 20`.
+4. After changes to `src/thr.cpp`, `src/remote.cpp`, or `src/event.cpp`, run the suite at least 8 times consecutively:
+   ```sh
+   for i in $(seq 8); do ./build/memwatch_tests --stress 2 || break; done
+   ```
 
-## Definition of done
+---
 
-Do not report a change as working until all of this has been run:
+## 5. Critical Environment Nuances
 
-```sh
-make clean && make                 # 0 warnings, -Werror is always on
-make test                          # 15/15
-./build-debug/memwatch_tests --stress 2   # after `make debug`
-./build/memwatch_tests --only-stress --stress 20
-```
-
-Timing-dependent faults have bitten this suite before: after any change to
-`src/thr.cpp`, `src/remote.cpp` or the event loop, run the full suite **at least
-8 times in a row** (`for i in $(seq 8); do ./build/memwatch_tests --stress 2 || break; done`).
-A single green run is not evidence for this code.
-
-## Rules that must not be broken
-
-1. **Never resume a thread inside a critical state.** `resume_now` is `false`
-   for every event drained inside `entering`/`critical`/`rcall`/`sstep`/
-   `rearming`. A pending faulting instruction re-faults by itself; do not
-   "help" it forward.
-2. **`armed` is an ownership flag, not a cache.** It is set to `false` *before*
-   the remote `mprotect` that restores protections and to `true` only *after*
-   `PROT_NONE` is really installed. Never reorder.
-3. **The borrow is exclusive.** Exactly one alive, stopped thread runs, chosen
-   by `pick_borrow`, and its full `user_regs_struct` is restored. Never
-   `PTRACE_CONT` anybody else during `rcall`.
-4. **The only accepted stop in a borrow is the controlled SIGTRAP** — except an
-   in-flight `PTRACE_EVENT_STOP`/`SIGSTOP` group stop, which is tolerated by
-   continuing (see `docs/design-notes.md`). Any other signal is `err_unexpected`.
-5. **Unowned signals are forwarded untouched**, with the original siginfo
-   (`PTRACE_CONT` with the signal number plus `PTRACE_SETSIGINFO`). The target
-   must not be able to tell memwatch exists.
-6. **Failure is fail-safe.** If a restore or an invariant fails, poison the
-   context (`mw_poison`): pages keep their `PROT_NONE` ownership and only
-   `mw_detach`/`mw_ctx_free` stay legal. Never un-protect memory you could not
-   restore.
-7. **No new dependencies, no new build modes, no suppressed warnings.** The
-   Makefile must stay warning-clean under its own flag list.
-
-## Conventions
-
-- `enum class rc_t` for every fallible call; no exceptions, no `errno` leakage.
-  A `nullptr`/invalid argument is `err_invalid`, never a crash.
-- Comments explain *why* (kernel behaviour, ordering constraint, invariant).
-  Do not narrate what the next line does.
-- Internal headers keep `#if !defined(__x86_64__) #error` — the stub encoding is
-  x86_64-specific even though the state machine is not.
-- Tests observe the **kernel**, not memwatch's opinion: `/proc/<pid>/task/*/stat`
-  for "is anything running", `/proc/<pid>/maps` for the real protection,
-  shared-memory counters in the child for "did it really do the work". A test
-  that only asserts on memwatch's own counters proves nothing.
-- New public API needs a line in `docs/invariants.md` only if it changes what is
-  guaranteed; otherwise update `README.md`'s API block.
-
-## Environment gotchas (cost real time)
-
-- The tracer must be the target's **parent** under Yama `ptrace_scope=1`
-  (`wsl -d Ubuntu -e cat /proc/sys/kernel/yama/ptrace_scope`). Test cases fork
-  their own targets for that reason.
-- **WSL wipes `/tmp` when the VM restarts.** Write test logs to
-  `/mnt/c/Users/User/AppData/Local/Temp/opencode/`, not `/tmp`.
-- The shell here is PowerShell 5.1: `$` inside a `wsl ... bash -lc '...'` one-liner
-  gets mangled or split. For anything with variables, loops or `;`, put the
-  script in `/mnt/c/Users/User/AppData/Local/Temp/opencode/<name>.sh` and run
-  `wsl -d Ubuntu -e bash /mnt/c/.../<name>.sh`.
-- Always bound a run (`timeout 120 ./build/memwatch_tests --only 6`); a
-  regression in the fault sequence shows up as a hang, not a failure.
-
-## Git
-
-Single logical change per commit, message in the imperative mood
-(`thr: wait for interrupt stops before claiming the global stop`). Do not commit
-`build/`/`build-debug/` (already ignored). Update `docs/` in the same commit as
-any behaviour change it describes.
+* **Yama LSM `ptrace_scope=1`**: Under Linux/WSL defaults, a tracer must be the **parent** of the tracee (`fork()` before `PTRACE_SEIZE`) or have `CAP_SYS_PTRACE`. Test cases must spawn their own children.
+* **WSL Filesystem**: WSL wipes `/tmp` upon VM restart. Long-lived temporary test logs must be written to `/mnt/c/Users/User/AppData/Local/Temp/opencode/`.
+* **PowerShell Syntax**: When running commands via PowerShell into WSL, escape `$` characters or write scripts directly to a file before invoking `wsl -d Ubuntu -e bash <script>.sh`.
+* **Timeout Guards**: Always bound test executions with timeouts (`timeout 120 ./build/memwatch_tests --only 6`) because state machine regressions manifest as hangs rather than crashes.

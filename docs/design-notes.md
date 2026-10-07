@@ -183,3 +183,77 @@ In rough order of value:
 5. **A fault-rate watchdog** that trips `mw_poison()` when a target's access
    pattern would make the tracer a bottleneck, instead of letting the target
    spend its life in `PROT_NONE`.
+
+## 10. The Lifecycle Scoping Trap: Why `mw_get_fault()` Was Phantom Post-Poll
+
+A classic design defect found in early tracer iterations:
+`mw_get_fault(ctx, &out)` was intended to allow callers to inspect the fault that caused `mw_poll()` to return. However, in `src/event.cpp`:
+
+```cpp
+  mw_fault_clear(ctx);             // have_fault = false
+  ctx->st = mw_state_t::critical;
+  ...
+  mw_thr_resume_all(ctx, true);
+  ctx->st = mw_state_t::idle;
+  return r;
+```
+
+Because `mw_fault_clear()` is executed immediately before returning to `idle`, `ctx->have_fault` is `false` when `mw_poll()` returns to user code. Calling `mw_get_fault()` after `mw_poll()` unconditionally returns `rc_t::err_not_found`.
+
+**The Architectural Remedy:**
+Rather than exposing an ephemeral global context field whose validity is tied to transient internal state transitions, fault reporting belongs either:
+1. Direct in the callback invocation parameter (`mw_cb_t(ctx, w, f)`), or
+2. Captured in a persistent `last_fault` record that survives transition back to `idle`, or
+3. Returned as a direct value in modern C++: `std::optional<fault_info> mw::context::poll(...)`.
+
+## 11. Complex Instructions & Single-Step Replay Fidelity
+
+When `PTRACE_SINGLESTEP` executes on `fault_tid`, not all x86_64 instructions are equal:
+
+* **Repeated String Instructions (`rep movsb`, `rep stosb`)**:
+  A `rep`-prefixed instruction executes iteratively, decrementing `rcx`. On Linux x86_64, `PTRACE_SINGLESTEP` over a `rep` string instruction steps **one iteration** (one element transfer), not the entire loop. When the watched page is re-armed with `PROT_NONE`, the subsequent iteration immediately traps again as a new page fault. This guarantees that `libmemwatch` captures every individual element access inside the watched range, rather than skipping the remainder of the rep sequence.
+* **Atomic RMW Instructions (`lock cmpxchg`, `lock xadd`)**:
+  Bus locks and cacheline locks assert hardware atomicity. Single-stepping a locked instruction causes the entire atomic memory transaction to commit in a single step trap. Because all other target threads are kept in a ptrace stop, inter-thread bus contention is eliminated during the step window.
+
+## 12. Linux & WSL2 Virtualization Nuances
+
+* **`process_vm_readv` / `writev` vs `PTRACE_PEEKDATA`**:
+  `PTRACE_PEEKDATA` incurs a context switch and ptrace wait per 8 bytes. For reading memory structures from inside watch callbacks, `process_vm_readv` bypasses ptrace serialization entirely, performing a direct kernel copy between address spaces via page table walks. Under WSL2 (Hyper-V VM running Linux kernel), `process_vm_readv` exhibits minimal overhead.
+* **Yama LSM `ptrace_scope=1`**:
+  On Ubuntu under WSL2, `/proc/sys/kernel/yama/ptrace_scope` defaults to 1. Non-root tracers can only attach to child processes created via `fork()` (or processes that explicitly call `prctl(PR_SET_PTRACER, tracer_pid)`). Self-contained test drivers must fork their own tracees to guarantee attach authorization.
+
+## 13. Event Loop Latency: From Sleep-Polling to Event Descriptors
+
+Currently, `mw_thr_wait_any()` implements timeout-bounded waiting using a non-blocking `waitpid(-1, WNOHANG)` loop paired with `nanosleep(200us)`. While resilient against lost wait wakeups, 200us sleep slices introduce latency jitter for real-time memory monitoring.
+
+The high-performance architectural path forward:
+* **`pidfd_open` + `epoll`**: Linux 5.3+ supports `pidfd_open(pid, 0)`. While standard `waitpid()` is signal-based, integrating `signalfd` on `SIGCHLD` into an `epoll_wait` event loop enables sub-microsecond event reaction without spinning in userland sleeps.
+
+## 14. Zero-Dependency Address Symbolization via `/proc/<pid>/maps`
+
+Developers debugging or tracing memory access rarely want raw pointers like `0x7ffff7dd2120`. They need human-readable identifiers: `libxyz.so+0x1120`.
+
+Full DWARF/ELF parsing (e.g. `libdw`, `libbacktrace`) adds heavy external dependencies, requires parsing `.debug_info` sections, and fails on stripped binaries. 
+By contrast, `/proc/<pid>/maps` provides an ideal zero-dependency solution:
+1. Each line maps a virtual range `[lo, hi)` to a shared library, binary path, or pseudo-path (`[heap]`, `[stack]`, `[vdso]`).
+2. An address $A \in [\text{lo}, \text{hi})$ is uniquely represented as `basename(path) + (A - lo)`.
+3. Because `libmemwatch` already parses `/proc/<pid>/maps` during `capture_prot()`, address resolution is essentially an in-memory lookup taking $\mathcal{O}(M)$ where $M$ is the number of mappings (typically $< 100$).
+
+## 15. Disassembly Leverage: Capstone vs Ad-hoc Opcode Parsing
+
+Inferring whether an access is a read or write by manually parsing x86_64 opcodes is a notorious rabbit hole:
+* Variable-length instructions (1 to 15 bytes).
+* ModR/M and SIB bytes.
+* REX prefixes, legacy prefixes, operand-size overrides (`0x66`, `0x67`).
+* RMW instructions (`add [rax], 1`) which are both a read and a write.
+
+Rather than leaking complex, fragile architecture-dependent decoding into `libmemwatch`'s core:
+* The core engine stays lean and purely reports the exact faulting `addr`, `rip`, and machine registers.
+* For consumers needing disassembly or instruction size (to advance `regs.rip` and use `MW_ACTION_SKIP`), **Capstone (`libcapstone`)** is the recommended companion. In under 10 lines of code, Capstone disassembles the instruction at `regs.rip`, yields `insn.size` for instantaneous instruction skipping, and cleanly classifies operand registers without bloating the tracer library.
+
+## 16. The Interactive Console Architecture (Linenoise)
+
+A natural evolution for `libmemwatch` is dropping into an interactive CLI shell when a watchpoint hits.
+Because the callback executes while all threads are stopped:
+* **Linenoise** (< 1,000 lines of pure C, zero dependencies) can be embedded to read commands from `stdin`.
+* Commands like `regs` (dump GPRs), `x/16b <addr>` (examine memory), `bt` (print backtrace via maps), `skip` (advance RIP), or `c` (continue) can drive the interceptor directly from the terminal without GDB.

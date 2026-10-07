@@ -48,6 +48,9 @@ void mw_log_errno(const char *fmt, ...) {
 const char *mw_strerror(rc_t r) {
   switch (r) {
     case rc_t::ok:           return "ok";
+    case rc_t::action_skip:   return "action skip (handled/stepped)";
+    case rc_t::action_disarm: return "action disarm";
+    case rc_t::action_kill:   return "action kill";
     case rc_t::err_attach:   return "ptrace attach/seize failed";
     case rc_t::err_ptrace:   return "ptrace/waitpid failure";
     case rc_t::err_mprotect: return "remote mprotect failed";
@@ -351,3 +354,94 @@ ssize_t mw_write_mem(mw_ctx_t *ctx, uintptr_t addr, const void *buf,
                      size_t len) {
   return mw_vm_write(ctx->pid, addr, buf, len);
 }
+
+rc_t mw_regs_get(mw_ctx_t *ctx, pid_t tid, struct user_regs_struct *out) {
+  if (ctx == nullptr || out == nullptr || tid <= 0) {
+    return rc_t::err_invalid;
+  }
+  if (ptrace(PTRACE_GETREGS, tid, nullptr, out) == -1) {
+    if (errno == ESRCH) {
+      return rc_t::err_not_found;
+    }
+    mw_log_errno("mw_regs_get(%d)", tid);
+    return rc_t::err_ptrace;
+  }
+  return rc_t::ok;
+}
+
+rc_t mw_regs_set(mw_ctx_t *ctx, pid_t tid, const struct user_regs_struct *in) {
+  if (ctx == nullptr || in == nullptr || tid <= 0) {
+    return rc_t::err_invalid;
+  }
+  if (ptrace(PTRACE_SETREGS, tid, nullptr,
+             const_cast<struct user_regs_struct *>(in)) == -1) {
+    if (errno == ESRCH) {
+      return rc_t::err_not_found;
+    }
+    mw_log_errno("mw_regs_set(%d)", tid);
+    return rc_t::err_ptrace;
+  }
+  return rc_t::ok;
+}
+
+rc_t mw_fpregs_get(mw_ctx_t *ctx, pid_t tid, struct user_fpregs_struct *out) {
+  if (ctx == nullptr || out == nullptr || tid <= 0) {
+    return rc_t::err_invalid;
+  }
+  if (ptrace(PTRACE_GETFPREGS, tid, nullptr, out) == -1) {
+    if (errno == ESRCH) {
+      return rc_t::err_not_found;
+    }
+    mw_log_errno("mw_fpregs_get(%d)", tid);
+    return rc_t::err_ptrace;
+  }
+  return rc_t::ok;
+}
+
+rc_t mw_fpregs_set(mw_ctx_t *ctx, pid_t tid,
+                   const struct user_fpregs_struct *in) {
+  if (ctx == nullptr || in == nullptr || tid <= 0) {
+    return rc_t::err_invalid;
+  }
+  if (ptrace(PTRACE_SETFPREGS, tid, nullptr,
+             const_cast<struct user_fpregs_struct *>(in)) == -1) {
+    if (errno == ESRCH) {
+      return rc_t::err_not_found;
+    }
+    mw_log_errno("mw_fpregs_set(%d)", tid);
+    return rc_t::err_ptrace;
+  }
+  return rc_t::ok;
+}
+
+rc_t mw_addr_resolve(mw_ctx_t *ctx, uintptr_t addr, char *buf, size_t buf_len) {
+  std::vector<mw_map_t> maps;
+  rc_t r;
+  if (ctx == nullptr || buf == nullptr || buf_len == 0) {
+    return rc_t::err_invalid;
+  }
+  r = mw_read_maps(ctx->pid, &maps);
+  if (r != rc_t::ok) {
+    (void)snprintf(buf, buf_len, "0x%lx", static_cast<unsigned long>(addr));
+    return r;
+  }
+  for (size_t i = 0; i < maps.size(); ++i) {
+    if (addr >= maps[i].lo && addr < maps[i].hi) {
+      uintptr_t off = addr - maps[i].lo;
+      if (!maps[i].path.empty()) {
+        const char *p = maps[i].path.c_str();
+        const char *slash = strrchr(p, '/');
+        const char *base = (slash != nullptr) ? slash + 1 : p;
+        (void)snprintf(buf, buf_len, "%s+0x%lx", base,
+                       static_cast<unsigned long>(off));
+      } else {
+        (void)snprintf(buf, buf_len, "[anon]+0x%lx",
+                       static_cast<unsigned long>(off));
+      }
+      return rc_t::ok;
+    }
+  }
+  (void)snprintf(buf, buf_len, "0x%lx", static_cast<unsigned long>(addr));
+  return rc_t::err_not_found;
+}
+

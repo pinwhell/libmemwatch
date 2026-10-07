@@ -80,27 +80,56 @@ their own targets. Useful switches:
 
 ## API
 
+### Low-Level Interceptor API (`extern "C"`)
+
 ```c
 rc_t mw_ctx_init(mw_ctx_t **out);
 rc_t mw_attach(mw_ctx_t *ctx, pid_t pid);
-rc_t mw_watch_add(mw_ctx_t *ctx, uintptr_t base, size_t size, mw_cb_t cb, void *ud);
+rc_t mw_watch_add(mw_ctx_t *ctx, uintptr_t base, size_t size, mw_callback_t cb, void *ud);
 rc_t mw_watch_del(mw_ctx_t *ctx, uintptr_t base, size_t size);
-rc_t mw_watch_del_all(mw_ctx_t *ctx);
-rc_t mw_poll(mw_ctx_t *ctx, int timeout_ms);      /* one event, end to end */
-rc_t mw_run(mw_ctx_t *ctx);
-bool mw_target_exit(const mw_ctx_t *ctx, int *wait_status);
-rc_t mw_detach(mw_ctx_t *ctx);                    /* restore pages, detach */
+
+/* Low-level tools available inside the watch callback */
+rc_t    mw_regs_get(mw_ctx_t *ctx, pid_t tid, struct user_regs_struct *out);
+rc_t    mw_regs_set(mw_ctx_t *ctx, pid_t tid, const struct user_regs_struct *in);
+ssize_t mw_read_mem(mw_ctx_t *ctx, uintptr_t addr, void *buf, size_t len);
+ssize_t mw_write_mem(mw_ctx_t *ctx, uintptr_t addr, const void *buf, size_t len);
+
+/* Zero-dependency address resolution via /proc/<pid>/maps -> "libxyz.so+0x1120" */
+rc_t    mw_addr_resolve(mw_ctx_t *ctx, uintptr_t addr, char *buf, size_t buf_len);
+
+/* Remote function call execution in target */
+rc_t    mw_remote_call(mw_ctx_t *ctx, pid_t tid, uintptr_t func_addr,
+                       const unsigned long *args, size_t nargs, unsigned long *out_ret);
+
+rc_t mw_poll(mw_ctx_t *ctx, int timeout_ms);
+rc_t mw_detach(mw_ctx_t *ctx);
 ```
 
-The callback receives `mw_fault_t { tid, addr, page, si_code, rip, watch, owned }`
+### Clean Interceptor Example
+
+```c
+mw_action_t on_touch(mw_ctx_t *ctx, const mw_intercept_t *ic, void *ud) {
+    char sym[128];
+    uint64_t val = 0;
+
+    mw_addr_resolve(ctx, ic->rip, sym, sizeof(sym)); // e.g., "libxyz.so+0x1120"
+    mw_read_mem(ctx, ic->addr, &val, sizeof(val));
+    printf("[WATCH] TID %d at %s touched 0x%lx (val=0x%lx)\n", ic->tid, sym, ic->addr, val);
+
+    return MW_ACTION_REPLAY; // or MW_ACTION_SKIP if emulating!
+}
+```
+
+
+The callback receives [`mw_fault_t`](file:///c:/Users/User/Documents/lab/libmemwatch/include/memwatch/types.hpp#L106-L114) `{ tid, addr, page, si_code, rip, watch, owned }`
 and runs in the tracer with every target thread stopped and the page still
-`PROT_NONE`; `mw_read_mem`/`mw_write_mem` are the only safe way to look at
+`PROT_NONE`; [`mw_read_mem`](file:///c:/Users/User/Documents/lab/libmemwatch/src/util.cpp#L346)/[`mw_write_mem`](file:///c:/Users/User/Documents/lab/libmemwatch/src/util.cpp#L350) (`process_vm_readv/writev`) are the only safe way to look at
 target memory from there.
 
 **Ownership of the exit status.** memwatch is the target's parent, so it is the
 only component that can `waitpid()` the target's death; a caller's own
 `waitpid()` returns `ECHILD` once `mw_poll`/`mw_detach` reported `err_gone`.
-`mw_target_exit()` hands back the wait status the kernel reported.
+[`mw_target_exit()`](file:///c:/Users/User/Documents/lab/libmemwatch/src/util.cpp#L336) hands back the wait status the kernel reported.
 
 **Failure policy.** Once an invariant is violated, or a remote call or restore
 fails in a way the tracer cannot undo, the context is *poisoned*: watches keep

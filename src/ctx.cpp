@@ -45,6 +45,8 @@ rc_t mw_ctx_init(mw_ctx_t **out) {
   ctx->poison_rc = rc_t::ok;
   ctx->target_exited = false;
   ctx->exit_status = 0;
+  ctx->has_last_fault = false;
+  (void)memset(&ctx->last_fault, 0, sizeof ctx->last_fault);
   (void)memset(&ctx->stats, 0, sizeof ctx->stats);
   *out = ctx;
   return rc_t::ok;
@@ -210,6 +212,8 @@ rc_t mw_detach(mw_ctx_t *ctx) {
   ctx->gadget_ready = false;
   ctx->gadget = 0;
   mw_fault_clear(ctx);
+  ctx->has_last_fault = false;
+  (void)memset(&ctx->last_fault, 0, sizeof ctx->last_fault);
   ctx->in_rcall = false;
   ctx->borrow_tid = 0;
   ctx->st = mw_state_t::idle;

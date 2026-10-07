@@ -35,6 +35,9 @@ struct mw_fault_t;
  * err_gone, err_range) so that no failure can be silently reported as success. */
 enum class rc_t : int {
   ok = 0,
+  action_skip,     /* watch callback requested MW_ACTION_SKIP */
+  action_disarm,   /* watch callback requested MW_ACTION_DISARM */
+  action_kill,     /* watch callback requested MW_ACTION_KILL */
   err_attach,      /* PTRACE_SEIZE / PTRACE_ATTACH failed */
   err_ptrace,      /* a ptrace() or waitpid() call failed unexpectedly */
   err_mprotect,    /* the remote mprotect syscall returned -1/errno */
@@ -53,6 +56,13 @@ enum class rc_t : int {
   err_gone,        /* target process exited */
   err_range,       /* overflowed or unmappable address range */
   err_poisoned,    /* context is poisoned; only mw_detach is legal */
+};
+
+enum mw_action_t : int {
+  MW_ACTION_REPLAY = 0, /* unprotect, single-step insn, re-arm PROT_NONE, resume */
+  MW_ACTION_SKIP   = 1, /* user handled access/bumped RIP: keep PROT_NONE, resume */
+  MW_ACTION_DISARM = 2, /* permanently remove watchpoint, restore memory, resume */
+  MW_ACTION_KILL   = 3, /* terminate target process */
 };
 
 enum class mw_state_t : int {
@@ -166,6 +176,10 @@ struct mw_ctx_t {
    * instead of being lost. */
   bool        target_exited;
   int         exit_status;
+
+  /* Persistent last fault record for mw_get_fault inspection */
+  bool        has_last_fault;
+  mw_fault_t  last_fault;
 
   mw_stats_t  stats;
 };

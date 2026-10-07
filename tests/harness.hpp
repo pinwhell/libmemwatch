@@ -35,6 +35,10 @@ struct ctl_t {
   uint32_t iters_per_thread[8];
   uint32_t child_exit;
   uint32_t unused;
+  /* For SKIP-style tests: fault/resume targets written by asm in child. */
+  uint64_t skip_fault;
+  uint64_t skip_resume;
+  uint32_t skip_next;
 };
 
 typedef void (*target_fn)(ctl_t *c);

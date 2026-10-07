@@ -276,6 +276,9 @@ rc_t mw_watch_del(mw_ctx_t *ctx, uintptr_t base, size_t size) {
     (void)leave_critical(ctx);
     return r;
   }
+  if (ctx->has_last_fault && ctx->last_fault.watch == &ctx->ws[idx]) {
+    ctx->last_fault.watch = nullptr;
+  }
   ctx->ws.erase(ctx->ws.begin() + static_cast<long>(idx));
   return leave_critical(ctx);
 }
@@ -307,6 +310,9 @@ rc_t mw_watch_del_all(mw_ctx_t *ctx) {
       }
       mw_log("mw_watch_del_all: watch %zu could not be restored", i);
     }
+  }
+  if (ctx->has_last_fault) {
+    ctx->last_fault.watch = nullptr;
   }
   if (first == rc_t::ok) {
     ctx->ws.clear();

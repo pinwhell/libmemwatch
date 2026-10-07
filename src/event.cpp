@@ -431,7 +431,72 @@ rc_t mw_ev_handle_fault(mw_ctx_t *ctx, pid_t tid, int sig) {
     }
     mw_log("owned fault tid=%d addr=0x%lx -> callback", tid,
            static_cast<unsigned long>(f.addr));
+    ctx->last_fault = f;
+    ctx->has_last_fault = true;
     r = w->cb(ctx, w, &f);
+    if (r == rc_t::action_skip) {
+      mw_log("callback requested MW_ACTION_SKIP on tid %d; page stays PROT_NONE",
+             tid);
+      mw_fault_clear(ctx);
+      ctx->st = mw_state_t::critical;
+      (void)mw_inv_check(ctx, "fault/before_resume");
+      rc_t res_r = mw_thr_resume_all(ctx, true);
+      ctx->st = mw_state_t::idle;
+      (void)mw_inv_check(ctx, "fault/after_resume");
+      return res_r;
+    }
+    if (r == rc_t::action_disarm) {
+      mw_log("callback requested MW_ACTION_DISARM for watch at 0x%lx",
+              static_cast<unsigned long>(w->r.base));
+      (void)mw_watch_disarm(ctx, w);
+      for (size_t wi = 0; wi < ctx->ws.size(); ++wi) {
+        if (&ctx->ws[wi] == w) {
+          if (ctx->has_last_fault && ctx->last_fault.watch == w) {
+            ctx->last_fault.watch = nullptr;
+          }
+          ctx->ws.erase(ctx->ws.begin() + static_cast<long>(wi));
+          break;
+        }
+      }
+      mw_fault_clear(ctx);
+      ctx->st = mw_state_t::critical;
+      (void)mw_inv_check(ctx, "fault/before_resume");
+      rc_t res_r = mw_thr_resume_all(ctx, true);
+      ctx->st = mw_state_t::idle;
+      (void)mw_inv_check(ctx, "fault/after_resume");
+      return res_r;
+    }
+    if (r == rc_t::action_kill) {
+      mw_log("callback requested MW_ACTION_KILL");
+      if (kill(ctx->pid, SIGKILL) != 0) {
+        mw_log_errno("kill(SIGKILL)");
+        return abort_and_resume(ctx, rc_t::err_syscall);
+      }
+      mw_fault_clear(ctx);
+      ctx->st = mw_state_t::idle;
+      /* Reap the death before returning err_gone: memwatch owns the target's
+       * wait status, so mw_target_exit() must immediately report SIGKILL and no
+       * zombie may be left behind.  The target is immortal now, so every stop
+       * is drained with resume_now=true to let the dying threads finish. */
+      for (unsigned guard = 0; guard < 1000000U; ++guard) {
+        pid_t ktid = 0;
+        int kstatus = 0;
+        rc_t kr = mw_thr_wait_any(ctx, &ktid, &kstatus, true, -1);
+        if (kr != rc_t::ok) {
+          return rc_t::err_gone;
+        }
+        int ksig = 0;
+        pid_t knewtid = 0;
+        ev_t kev = mw_ev_classify(ctx, ktid, kstatus, &ksig, &knewtid);
+        if (kev == ev_t::target_exit) {
+          (void)mw_ev_apply(ctx, kev, ktid, kstatus, false);
+          return rc_t::err_gone;
+        }
+        (void)mw_ev_apply(ctx, kev, ktid, kstatus, true);
+      }
+      mw_log("action_kill: too many stops while reaping the target");
+      return rc_t::err_gone;
+    }
     if (r != rc_t::ok) {
       mw_log("watch callback returned %s", mw_strerror(r));
     }
@@ -591,14 +656,18 @@ rc_t mw_get_fault(mw_ctx_t *ctx, mw_fault_t *out) {
   if (ctx == nullptr || out == nullptr) {
     return rc_t::err_invalid;
   }
-  if (!ctx->have_fault || ctx->fault_watch == nullptr) {
-    return rc_t::err_not_found;
+  if (ctx->have_fault && ctx->fault_watch != nullptr) {
+    (void)memset(out, 0, sizeof *out);
+    out->tid = ctx->fault_tid;
+    out->addr = ctx->fault_addr;
+    out->p = pg_align_down(ctx->fault_addr, ctx->page_size);
+    out->watch = ctx->fault_watch;
+    out->owned = true;
+    return rc_t::ok;
   }
-  (void)memset(out, 0, sizeof *out);
-  out->tid = ctx->fault_tid;
-  out->addr = ctx->fault_addr;
-  out->p = pg_align_down(ctx->fault_addr, ctx->page_size);
-  out->watch = ctx->fault_watch;
-  out->owned = true;
-  return rc_t::ok;
+  if (ctx->has_last_fault) {
+    *out = ctx->last_fault;
+    return rc_t::ok;
+  }
+  return rc_t::err_not_found;
 }
